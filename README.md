@@ -51,17 +51,17 @@ Bitbucket in the Git history.
 
 1. Run the script from the command line.
 
-         python backup_bitbucket_snippets.py --workspace <your_workspace_slug> \
-                                             --auth-user <your_bitbucket_username> \
+         python backup_bitbucket_snippets.py --auth-user <your_bitbucket_username> \
                                              --auth-pass <your_app_password> \
                                              [options]
 
 ### Command-Line Arguments
 
-- `--workspace` (Required): Your Bitbucket workspace ID (slug). Snippets from this workspace will be targeted if `--snippet-ids` is
-  not used. Also used as context for fetching specific snippets if their workspace info is missing.
 - `--auth-user` (Required): Your Bitbucket username for authentication.
 - `--auth-pass` (Required): Your Bitbucket App Password.
+- `--workspace` (Optional): Your Bitbucket workspace ID (slug). Snippets from this workspace will be targeted if `--snippet-ids` is
+  not used. Also used as context for fetching specific snippets if their workspace info is missing. Default to the value of 
+  `--auth-user` if not supplied.
 - `--output-dir` (Optional): The local directory where the Git backup repository will be created/updated. Defaults to
   `bitbucket_snippets_backup`.
 - `--api-base-url` (Optional): The base URL for the Bitbucket API. Defaults to `https://api.bitbucket.org/2.0`.

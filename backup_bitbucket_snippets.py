@@ -210,9 +210,10 @@ def main():
         description="Backup BitBucket Snippets to a local Git repository.",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--workspace", required=True, help="Bitbucket workspace slug (username or team ID).")
     parser.add_argument("--auth-user", required=True, help="Bitbucket username for authentication.")
     parser.add_argument("--auth-pass", required=True, help="Bitbucket App Password for authentication.")
+    parser.add_argument("--workspace",
+                        help="Bitbucket workspace slug (username or team ID). If not provided, defaults to the value of --auth-user.")
     parser.add_argument("--output-dir", default="bitbucket_snippets_backup",
                         help="Local directory to store the Git backup (default: bitbucket_snippets_backup).")
     parser.add_argument("--api-base-url", default="https://api.bitbucket.org/2.0",
@@ -229,6 +230,11 @@ def main():
                         help="Email to use for the Git committer (default: \"backup@bitbucket-script.local\").")
 
     args = parser.parse_args()
+
+    # Default workspace to auth-user if not supplied
+    if args.workspace is None:
+        args.workspace = args.auth_user
+        print(f"INFO: No --workspace provided, defaulting to --auth-user: {args.workspace}")
 
     local_repo_path = args.output_dir
     setup_local_repo(local_repo_path)
