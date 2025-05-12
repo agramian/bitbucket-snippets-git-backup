@@ -60,14 +60,15 @@ Bitbucket in the Git history.
 - `--auth-user` (Required): Your Bitbucket username for authentication.
 - `--auth-pass` (Required): Your Bitbucket App Password.
 - `--workspace` (Optional): Your Bitbucket workspace ID (slug). Snippets from this workspace will be targeted if `--snippet-ids` is
-  not used. Also used as context for fetching specific snippets if their workspace info is missing. Default to the value of 
+  not used. Also used as context for fetching specific snippets if their workspace info is missing. Default to the value of
   `--auth-user` if not supplied.
 - `--output-dir` (Optional): The local directory where the Git backup repository will be created/updated. Defaults to
   `bitbucket_snippets_backup`.
 - `--api-base-url` (Optional): The base URL for the Bitbucket API. Defaults to `https://api.bitbucket.org/2.0`.
-- `--role` (Optional): Filter initial snippet list by role (`owner`, `contributor`, or `member`) when `--snippet-ids` is not used.
-- `--historical` (Optional): If specified, backup all historical revisions of each snippet. By default (if this flag is not
-  present), only the latest revision of each snippet is backed up.
+- `--role` (Optional): Filter initial snippet list by role (`owner`, `contributor`, or `member`) when `--snippet-ids` is *not* used.
+- `--historical` (Optional): If specified (e.g., `--historical`), the script will back up all historical revisions of each selected
+  snippet, creating commits in a globally chronological order based on the original revision dates.
+  By default (if this flag is *not* present), only the latest revision of each snippet is backed up.
 - `--snippet-ids` (Optional): A comma-separated list of specific snippet IDs (the encoded_id from Bitbucket, e.g., `id1,id2`) to
   back up. If provided, only these snippets will be processed, and the general listing for the workspace (and `--role`) will be
   ignored. Example: `--snippet-ids "abcdef12,ghijkl34"`
@@ -126,15 +127,25 @@ The backup will be organized as follows:
 
 ## Git Commit History
 
-- **Latest Only (Default):** One commit per snippet, representing its latest state.
-- **Historical (`--historical` flag):** Each revision of a snippet from Bitbucket is translated into a separate Git commit.
-- **Commit Dates:** Both the author date and committer date of the Git commits are set to the original timestamp of the snippet
-  revision on Bitbucket.
+- **Default Behavior (Latest Revision Only)**: If the `--historical` flag is *not* used, the script creates one commit per
+  snippet, representing its latest known state at the time of backup.
+- **Historical Mode (`--historical` flag)**:
+    * When the `--historical` flag is used, each revision of every backed-up snippet from Bitbucket is translated into a separate
+      Git commit.
+    * **Crucially, these commits are created in a globally chronological order** based on the original timestamp of the snippet
+      revisions. This means `git log` (and its variants like `--date-order` or `--author-date-order`) will display a history that
+      interleaves revisions from different snippets according to their actual historical timestamps.
+    * The parent of each commit in the backup repository will be the commit that immediately preceded it in this global historical
+      timeline.
+- **Commit Dates**: For all data commits (latest or historical), both the author date and committer date in Git are set to the
+  original timestamp of the snippet revision on Bitbucket.
 - **Author:** The Git commit author is set to the original author of the snippet revision (name parsed from Bitbucket data, email is
   a placeholder if not directly available).
 - **Committer:** The Git committer details are configurable via CLI args (defaults to "Snippet Backup Script" / "
   backup@bitbucket-script.local"). This helps distinguish automated backup commits from original authorship.
 - **Commit Messages:** Include the snippet title, ID, original revision hash (if applicable), and the original commit message.
+- **README Commits**: Commits related to updating the `README.md` files within the backup repository are made by the backup script
+  committer with the current timestamp.
 
 ## Notes and Limitations
 

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -24,7 +25,7 @@ def retry_api_call(max_retries=3, initial_delay=2, backoff_factor=2):
                     if result is None and func.__name__ not in ['fetch_file_content', 'fetch_from_bitbucket_paginated',
                                                                 'fetch_single_from_bitbucket']:
                         pass
-                    return result  # Success
+                    return result
                 except requests.exceptions.RequestException as e:
                     attempts += 1
                     status_code = e.response.status_code if hasattr(e, 'response') and e.response is not None else None
@@ -43,23 +44,22 @@ def retry_api_call(max_retries=3, initial_delay=2, backoff_factor=2):
                             try:
                                 wait_time = int(retry_after_header)
                                 print(f"    Honoring Retry-After header: waiting {wait_time}s")
-                                current_delay = wait_time  # Override calculated delay
+                                current_delay = wait_time
                             except ValueError:
                                 print(
                                     f"    Could not parse Retry-After header ('{retry_after_header}'). Using exponential backoff.")
                                 current_delay = initial_delay * (backoff_factor ** (attempts - 1))
                         else:
                             current_delay = initial_delay * (backoff_factor ** (attempts - 1))
-                    elif status_code is None:  # Network issue
+                    elif status_code is None:
                         should_retry = True
                         current_delay = initial_delay * (backoff_factor ** (attempts - 1))
 
                     if not should_retry:
                         print(f"    Non-retryable HTTP error for {func.__name__}. Status: {status_code if status_code else 'N/A'}")
-                        # For 404s from main fetch functions, we might not want to retry and just return None
                         if status_code == 404 and func.__name__ in ['fetch_from_bitbucket_paginated',
-                                                                    'fetch_single_from_bitbucket']:
-                            return None  # No data found
+                                                                    'fetch_single_from_bitbucket', 'fetch_file_content']:
+                            return None
                         return None
 
                     print(f"    Retrying in {current_delay}s...")
@@ -86,7 +86,11 @@ def fetch_from_bitbucket_paginated(endpoint, auth_user, auth_password, api_base_
         print(f"Fetching page {page_count}: {url}")
         response = requests.get(url, auth=(auth_user, auth_password))
         response.raise_for_status()
-        data = response.json()
+        try:
+            data = response.json()
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON from {url}: {e}\nResponse text: {response.text[:500]}...")
+            return None
 
         if "values" in data:
             all_values.extend(data["values"])
@@ -110,7 +114,11 @@ def fetch_single_from_bitbucket(endpoint, auth_user, auth_password, api_base_url
     print(f"Fetching single: {url}")
     response = requests.get(url, auth=(auth_user, auth_password))
     response.raise_for_status()
-    return response.json()
+    try:
+        return response.json()
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON from {url}: {e}\nResponse text: {response.text[:500]}...")
+        return None
 
 
 @retry_api_call()
@@ -120,8 +128,6 @@ def fetch_file_content(url, auth_user, auth_password):
     response.raise_for_status()
     return response.content
 
-
-# ... (rest of the script from the previous response remains the same) ...
 
 def sanitize_directory_name(name):
     name = str(name)
@@ -139,11 +145,16 @@ def run_git_command(command_list, cwd, env_vars=None):
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
         stdout, stderr = process.communicate()
         if process.returncode != 0:
-            if not (command_list[0:2] == ["git", "commit"] and (
-                    "nothing to commit" in stderr.lower() or "no changes added to commit" in stderr.lower() or "clean, working tree clean" in stderr.lower())):
+            is_nothing_to_commit_msg = "nothing to commit" in stderr.lower() or \
+                                       "no changes added to commit" in stderr.lower() or \
+                                       "working tree clean" in stderr.lower()
+            is_allow_empty_variant = command_list[0:2] == ["git", "commit"] and \
+                                     any(arg in command_list for arg in ["--allow-empty", "--allow-empty-message"])
+
+            if not (is_allow_empty_variant and is_nothing_to_commit_msg):
                 print(f"  Error running Git command: {' '.join(command_list)}")
-                if stdout: print(f"  Stdout: {stdout.strip()}")
-                if stderr: print(f"  Stderr: {stderr.strip()}")
+                if stdout and stdout.strip(): print(f"  Stdout: {stdout.strip()}")
+                if stderr and stderr.strip(): print(f"  Stderr: {stderr.strip()}")
             return False, stderr
         return stdout, None
     except Exception as e:
@@ -163,6 +174,7 @@ def setup_local_repo(repo_path):
 
 def generate_snippet_readme(snippet_dir_path, snippet_title, snippet_id, bitbucket_html_link, files_in_latest_commit):
     readme_path = os.path.join(snippet_dir_path, "README.md")
+    os.makedirs(os.path.dirname(readme_path), exist_ok=True)
     content = f"# {snippet_title}\n\n"
     content += f"**Original Snippet ID:** `{snippet_id}`\n"
     if bitbucket_html_link:
@@ -206,10 +218,8 @@ def generate_root_readme(repo_path, backed_up_snippets_info):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Backup BitBucket Snippets to a local Git repository.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
+    parser = argparse.ArgumentParser(description="Backup BitBucket Snippets to a local Git repository.",
+                                     formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--auth-user", required=True, help="Bitbucket username for authentication.")
     parser.add_argument("--auth-pass", required=True, help="Bitbucket App Password for authentication.")
     parser.add_argument("--workspace",
@@ -239,8 +249,10 @@ def main():
     local_repo_path = args.output_dir
     setup_local_repo(local_repo_path)
 
-    all_backed_up_snippets_info = []
+    all_snippets_info_for_readme = []
+    all_pending_commits_data = []
 
+    print("\n--- Phase 1: Aggregating all snippet revision information ---")
     snippets_to_process = []
     if args.snippet_ids:
         ids_list = [s_id.strip() for s_id in args.snippet_ids.split(',')]
@@ -248,22 +260,21 @@ def main():
         for s_id in ids_list:
             snippet_detail_endpoint = f"/snippets/{args.workspace}/{s_id}"
             snippet_detail = fetch_single_from_bitbucket(snippet_detail_endpoint, args.auth_user, args.auth_pass, args.api_base_url)
-            if snippet_detail and 'type' in snippet_detail and snippet_detail['type'] == 'snippet':
+            if snippet_detail and snippet_detail.get('type') == 'snippet':
                 snippets_to_process.append(snippet_detail)
             else:
                 print(f"Could not fetch details for snippet ID: {s_id} in workspace {args.workspace}. Response: {snippet_detail}")
     else:
         snippets_list_endpoint = f"/snippets/{args.workspace}"
-        if args.role:
-            snippets_list_endpoint += f"?role={args.role}"
-        print(f"Fetching snippets from workspace: {args.workspace} ...")  # (Endpoint: {snippets_list_endpoint})
+        if args.role: snippets_list_endpoint += f"?role={args.role}"
+        print(f"Fetching snippets from workspace: {args.workspace} ...")
         snippets_data = fetch_from_bitbucket_paginated(snippets_list_endpoint, args.auth_user, args.auth_pass, args.api_base_url)
         if snippets_data and "values" in snippets_data:
             snippets_to_process = snippets_data["values"]
 
     if not snippets_to_process:
         print("No snippets found or specified to process.")
-        generate_root_readme(local_repo_path, all_backed_up_snippets_info)
+        generate_root_readme(local_repo_path, all_snippets_info_for_readme)
         return
 
     for snippet_info in snippets_to_process:
@@ -275,7 +286,6 @@ def main():
         snippet_title = snippet_info.get("title", f"Untitled_Snippet_{snippet_id}")
         sanitized_title_part = sanitize_directory_name(snippet_title)
         snippet_folder_name = f"{sanitized_title_part}_{snippet_id}"
-
         bitbucket_html_link = snippet_info.get("links", {}).get("html", {}).get("href")
 
         workspace_slug_for_snippet_api = args.workspace
@@ -284,113 +294,140 @@ def main():
         elif "owner" in snippet_info and "nickname" in snippet_info["owner"]:
             workspace_slug_for_snippet_api = snippet_info["owner"]["nickname"]
 
-        print(f"\nProcessing snippet: '{snippet_title}' (ID: {snippet_id}, Folder: {snippet_folder_name})")
+        all_snippets_info_for_readme.append({
+            'id': snippet_id, 'title': snippet_title,
+            'dir_name': snippet_folder_name, 'html_link': bitbucket_html_link
+        })
+
+        if args.historical:
+            commits_endpoint = f"/snippets/{workspace_slug_for_snippet_api}/{snippet_id}/commits"
+            print(f"  Fetching commits for snippet {snippet_id}...")
+            commits_data = fetch_from_bitbucket_paginated(commits_endpoint, args.auth_user, args.auth_pass, args.api_base_url)
+            if commits_data and commits_data.get("values"):
+                for commit_details_raw in commits_data["values"]:
+                    all_pending_commits_data.append({
+                        "snippet_id": snippet_id, "snippet_title": snippet_title,
+                        "snippet_folder_name": snippet_folder_name,
+                        "workspace_slug_for_snippet_api": workspace_slug_for_snippet_api,  # Storing for Phase 3
+                        "commit_sha": commit_details_raw["hash"], "commit_date_str": commit_details_raw["date"],
+                        "commit_author_obj": commit_details_raw.get("author", {}),
+                        "commit_message_summary": commit_details_raw.get("message", f"Revision {commit_details_raw['hash'][:7]}"),
+                        "source_data_for_files_override": None
+                    })
+            elif args.historical:  # If --historical but no commits found
+                print(
+                    f"    No explicit commit history for '{snippet_title}' (ID: {snippet_id}), but --historical was set. Will attempt to back up current state as single revision.")
+
+        # Logic to add the "latest state" if not doing historical OR if historical failed to find commits
+        needs_latest_state_processing = not args.historical
+        if args.historical and not any(pc['snippet_id'] == snippet_id and pc.get("source_data_for_files_override") is None for pc in
+                                       all_pending_commits_data):
+            needs_latest_state_processing = True  # If historical, but no actual history was added, process latest
+
+        if needs_latest_state_processing:
+            print(f"    Processing latest state for snippet '{snippet_title}' (ID: {snippet_id}).")
+            full_snippet_detail = fetch_single_from_bitbucket(f"/snippets/{workspace_slug_for_snippet_api}/{snippet_id}",
+                                                              args.auth_user, args.auth_pass, args.api_base_url)
+            if not full_snippet_detail:
+                print(f"    Failed to fetch full details for snippet {snippet_id}. Skipping this snippet.")
+                all_snippets_info_for_readme = [s for s in all_snippets_info_for_readme if s['id'] != snippet_id]
+                continue
+
+            actual_head_sha = snippet_id
+            if full_snippet_detail.get("files"):
+                file_keys = list(full_snippet_detail.get("files", {}).keys())
+                if file_keys:
+                    first_file_name = file_keys[0]
+                    file_meta = full_snippet_detail.get("files", {}).get(first_file_name, {})
+                    file_self_link = file_meta.get("links", {}).get("self", {}).get("href", "")
+                    match = re.search(r'/snippets/[^/]+/[^/]+/([^/]+)/files/', file_self_link)
+                    if match: actual_head_sha = match.group(1)
+
+            latest_date = full_snippet_detail.get("updated_on",
+                                                  full_snippet_detail.get("created_on", datetime.now(timezone.utc).isoformat()))
+            owner_info = full_snippet_detail.get("owner", snippet_info.get("owner", {}))
+            author_name = owner_info.get("nickname", owner_info.get("display_name", args.committer_name))
+
+            all_pending_commits_data.append({
+                "snippet_id": snippet_id, "snippet_title": snippet_title,
+                "snippet_folder_name": snippet_folder_name,
+                "workspace_slug_for_snippet_api": workspace_slug_for_snippet_api,  # Storing for Phase 3
+                "commit_sha": actual_head_sha,
+                "commit_display_sha": actual_head_sha,
+                "commit_date_str": latest_date,
+                "commit_author_obj": {"raw": f"{author_name} <placeholder@example.com>", "nickname": author_name,
+                                      "display_name": author_name},
+                "commit_message_summary": f"Latest state of snippet '{snippet_title}'",
+                "source_data_for_files_override": full_snippet_detail
+            })
+
+    if not all_pending_commits_data:
+        print("No revisions to process across all snippets after aggregation.")
+        generate_root_readme(local_repo_path, all_snippets_info_for_readme)
+        return
+
+    print("\n--- Phase 2: Sorting all revisions globally by date ---")
+    try:
+        for pc_item in all_pending_commits_data:
+            date_str = pc_item["commit_date_str"]
+            if not isinstance(date_str, str): date_str = datetime.now(timezone.utc).isoformat()
+            pc_item["commit_date_obj"] = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        sorted_global_commits = sorted(all_pending_commits_data, key=lambda x: x['commit_date_obj'])
+    except (ValueError, TypeError) as e:
+        print(f"Error converting commit dates for sorting: {e}. Aborting.")
+        return
+
+    print(f"Total revisions to process chronologically: {len(sorted_global_commits)}")
+
+    print("\n--- Phase 3: Processing and committing revisions chronologically ---")
+    snippet_latest_file_lists = {info['id']: set() for info in all_snippets_info_for_readme}
+
+    for pending_commit_data in sorted_global_commits:
+        snippet_id = pending_commit_data["snippet_id"]
+        snippet_title = pending_commit_data["snippet_title"]
+        snippet_folder_name = pending_commit_data["snippet_folder_name"]
+        # Use the consistent variable name from aggregation phase
+        workspace_slug_for_snippet_api = pending_commit_data["workspace_slug_for_snippet_api"]
+        commit_sha = pending_commit_data["commit_sha"]
+        commit_display_sha_for_log = pending_commit_data.get("commit_display_sha", commit_sha)
+
+        commit_date_for_git = pending_commit_data["commit_date_obj"].isoformat()
+        commit_author_obj = pending_commit_data["commit_author_obj"]
+        commit_message_summary = pending_commit_data["commit_message_summary"].replace('"', "'").replace('\n', ' ')
+
+        commit_author_name = args.committer_name
+        commit_author_email = args.committer_email
+        raw_author_str = commit_author_obj.get("raw")
+
+        if raw_author_str and '<' in raw_author_str and '>' in raw_author_str:
+            parts = raw_author_str.split('<', 1)
+            commit_author_name = parts[0].strip() or commit_author_name
+            commit_author_email = parts[1].replace('>', '').strip() or commit_author_email
+        elif raw_author_str:
+            commit_author_name = raw_author_str.strip() or commit_author_name
+        elif "nickname" in commit_author_obj:
+            commit_author_name = commit_author_obj.get("nickname", commit_author_name)
+        elif "display_name" in commit_author_obj:
+            commit_author_name = commit_author_obj.get("display_name", commit_author_name)
+
+        print(
+            f"    Processing Snippet '{snippet_title}' (ID: {snippet_id}) Revision: {commit_display_sha_for_log[:12]} dated {commit_date_for_git}")
 
         snippet_files_base_dir = os.path.join(local_repo_path, snippet_folder_name)
-        if not os.path.exists(snippet_files_base_dir):
-            os.makedirs(snippet_files_base_dir)
+        os.makedirs(snippet_files_base_dir, exist_ok=True)
 
-        current_files_in_snippet_dir_for_readme = set()
+        revision_data = pending_commit_data.get("source_data_for_files_override")
+        if not revision_data:
+            revision_details_endpoint = f"/snippets/{workspace_slug_for_snippet_api}/{snippet_id}/{commit_sha}"
+            revision_data = fetch_single_from_bitbucket(revision_details_endpoint, args.auth_user, args.auth_pass,
+                                                        args.api_base_url)
 
-        commits_endpoint = f"/snippets/{workspace_slug_for_snippet_api}/{snippet_id}/commits"
-        print(f"  Fetching commits for snippet {snippet_id}...")
-        commits_data = fetch_from_bitbucket_paginated(commits_endpoint, args.auth_user, args.auth_pass, args.api_base_url)
-
-        commits_to_process = []
-        if commits_data and "values" in commits_data and commits_data["values"]:
-            try:
-                # Ensure dates are actual datetime objects for sorting if not already
-                for c_detail in commits_data["values"]:
-                    if isinstance(c_detail.get("date"), str):
-                        c_detail["date_obj"] = datetime.fromisoformat(c_detail["date"].replace("Z", "+00:00"))
-                    else:  # Should not happen if API is consistent
-                        c_detail["date_obj"] = datetime.now(timezone.utc)
-
-                sorted_commits = sorted(commits_data["values"], key=lambda c: c["date_obj"])
-
-                if args.historical:
-                    commits_to_process = sorted_commits
-                elif sorted_commits:
-                    commits_to_process = [sorted_commits[-1]]
-                else:  # No commits, but not historical handled by block below
-                    print(f"    No commit history found for snippet {snippet_id}. Processing current state as 'latest'.")
-            except (TypeError, KeyError, ValueError) as e:
-                print(
-                    f"    Error sorting/processing commits for snippet {snippet_id}. Error: {e}. Will attempt to process latest state only.")
-
-        if not commits_to_process:
+        files_in_this_commit_relative_paths = set()
+        if not revision_data or "files" not in revision_data or not isinstance(revision_data.get("files"), dict):
             print(
-                f"    No historical commits to process or only latest requested. Processing current state of snippet {snippet_id}.")
-            owner_info = snippet_info.get("owner", {})  # Use owner as more general than creator for snippets
-            author_name = owner_info.get("nickname", owner_info.get("display_name", args.committer_name))
-            author_email = "author@example.com"
-
-            # Use snippet's updated_on or created_on for the single commit date
-            latest_date = snippet_info.get("updated_on", snippet_info.get("created_on", datetime.now(timezone.utc).isoformat()))
-
-            commits_to_process = [{
-                "hash": snippet_info.get("id"),  # Use snippet_id as revision for HEAD
-                "date": latest_date,
-                "author": {"raw": f"{author_name} <{author_email}>", "nickname": author_name, "display_name": author_name},
-                "message": f"Latest state of snippet '{snippet_title}' as of {latest_date}"
-            }]
-            # To fetch files for this "latest" state, we'll use the main snippet_info
-            # or fetch the HEAD revision of the snippet explicitly.
-            # The endpoint `/snippets/{workspace}/{encoded_id}/{node_id}` where node_id can be HEAD or the latest commit hash.
-            # For simplicity, if snippet_info itself contains 'files', we use that.
-            # If not, we'd fetch `/snippets/{workspace_slug_for_snippet_api}/{snippet_id}/HEAD`
-            # However, the main snippet_info usually has the HEAD files.
-
-        for i, commit_details in enumerate(commits_to_process):
-            commit_sha = commit_details["hash"]
-            commit_date_str_raw = commit_details["date"]
-            try:
-                commit_datetime_obj = datetime.fromisoformat(commit_date_str_raw.replace("Z", "+00:00"))
-                commit_date_for_git = commit_datetime_obj.isoformat()
-            except ValueError:
-                print(f"      Warning: Could not parse date '{commit_date_str_raw}' for commit {commit_sha}. Using current time.")
-                commit_date_for_git = datetime.now(timezone.utc).isoformat()
-
-            commit_author_obj = commit_details.get("author", {})
-            raw_author_str = commit_author_obj.get("raw")
-            commit_author_name = args.committer_name
-            commit_author_email = args.committer_email
-
-            if raw_author_str and '<' in raw_author_str and '>' in raw_author_str:
-                parts = raw_author_str.split('<', 1)
-                commit_author_name = parts[0].strip() or commit_author_name
-                commit_author_email = parts[1].replace('>', '').strip() or commit_author_email
-            elif raw_author_str:
-                commit_author_name = raw_author_str.strip() or commit_author_name
-            elif "nickname" in commit_author_obj:
-                commit_author_name = commit_author_obj.get("nickname", commit_author_name)
-            elif "display_name" in commit_author_obj:
-                commit_author_name = commit_author_obj.get("display_name", commit_author_name)
-
-            commit_message_summary = commit_details.get("message", f"Backup of revision {commit_sha[:7]}")
-            commit_message_summary = commit_message_summary.replace('"', "'").replace('\n', ' ')
-
-            print(f"    Processing revision: {commit_sha[:12]} dated {commit_date_for_git}")
-
-            # Determine the source of file data for this commit
-            # If this is a synthesized "latest" commit, revision_data might be snippet_info itself
-            if commit_sha == snippet_info.get("id") and 'files' in snippet_info:  # Heuristic for synthesized latest commit
-                revision_data = snippet_info
-                print("      Using files from main snippet object for latest state.")
-            else:
-                revision_details_endpoint = f"/snippets/{workspace_slug_for_snippet_api}/{snippet_id}/{commit_sha}"
-                revision_data = fetch_single_from_bitbucket(revision_details_endpoint, args.auth_user, args.auth_pass,
-                                                            args.api_base_url)
-
-            if not revision_data or "files" not in revision_data or not isinstance(revision_data.get("files"), dict):
-                print(f"      Could not get valid file list for revision {commit_sha}. Skipping this revision's files.")
-                # If it's the last/only revision, we still want to add info for README generation
-                if i == len(commits_to_process) - 1:
-                    current_files_in_snippet_dir_for_readme = set()  # No files could be determined
-                continue  # Skip file processing for this commit
-
-            files_in_this_commit_relative_paths = set()
-
+                f"      Could not get valid file list for snippet '{snippet_title}' revision {commit_sha}. Files data: {str(revision_data.get('files'))[:200] if revision_data else 'No revision data'}...")
+            # files_in_this_commit_relative_paths remains empty
+        else:
             for filename_in_snippet in revision_data["files"].keys():
                 relative_file_path = filename_in_snippet
                 files_in_this_commit_relative_paths.add(relative_file_path)
@@ -411,71 +448,81 @@ def main():
                         with open(local_file_path, "wb") as f:
                             f.write(file_content)
 
-            if args.historical:
-                if os.path.exists(snippet_files_base_dir):
-                    for root_dir, _, files_in_git_dir in os.walk(snippet_files_base_dir):
-                        for f_name_git in files_in_git_dir:
-                            if f_name_git == "README.md": continue
-                            full_path_in_git_fs = os.path.join(root_dir, f_name_git)
-                            relative_path_in_git_fs = os.path.relpath(full_path_in_git_fs, snippet_files_base_dir).replace(
-                                os.path.sep, "/")
-                            if relative_path_in_git_fs not in files_in_this_commit_relative_paths:
-                                git_path_to_remove = os.path.join(snippet_folder_name, relative_path_in_git_fs).replace(os.path.sep,
-                                                                                                                        "/")
-                                run_git_command(["git", "rm", git_path_to_remove], cwd=local_repo_path)
+        snippet_latest_file_lists[snippet_id] = files_in_this_commit_relative_paths
 
-            if i == len(commits_to_process) - 1:
-                current_files_in_snippet_dir_for_readme = files_in_this_commit_relative_paths
+        tracked_files_stdout, _ = run_git_command(["git", "ls-files", snippet_folder_name], cwd=local_repo_path)
+        if tracked_files_stdout is not None:
+            current_git_files_for_snippet_dir = set()
+            if tracked_files_stdout.strip():
+                for line in tracked_files_stdout.strip().split('\n'):
+                    if line.startswith(snippet_folder_name + os.path.sep):
+                        current_git_files_for_snippet_dir.add(line[len(snippet_folder_name) + 1:].replace(os.path.sep, "/"))
 
-            run_git_command(["git", "add", snippet_folder_name], cwd=local_repo_path)
+            for git_file_rel_to_snippet_dir in current_git_files_for_snippet_dir:
+                if git_file_rel_to_snippet_dir not in files_in_this_commit_relative_paths and git_file_rel_to_snippet_dir != "README.md":
+                    file_to_remove_in_repo = os.path.join(snippet_folder_name, git_file_rel_to_snippet_dir).replace(os.path.sep,
+                                                                                                                    "/")
+                    print(
+                        f"      Marking for deletion (not in current snippet revision): {file_to_remove_in_repo.replace(snippet_folder_name + '/', '')}")
+                    run_git_command(["git", "rm", file_to_remove_in_repo], cwd=local_repo_path)
 
-            commit_env = {
-                "GIT_AUTHOR_NAME": commit_author_name,
-                "GIT_AUTHOR_EMAIL": commit_author_email,
-                "GIT_AUTHOR_DATE": commit_date_for_git,
-                "GIT_COMMITTER_NAME": args.committer_name,
-                "GIT_COMMITTER_EMAIL": args.committer_email,
-                "GIT_COMMITTER_DATE": commit_date_for_git
-            }
+        run_git_command(["git", "add", snippet_folder_name], cwd=local_repo_path)
 
-            final_commit_message = f"Snippet: {snippet_title} (ID: {snippet_id})\nRev: {commit_sha[:7]}\n\n{commit_message_summary}"
+        commit_env = {
+            "GIT_AUTHOR_NAME": commit_author_name,
+            "GIT_AUTHOR_EMAIL": commit_author_email,
+            "GIT_AUTHOR_DATE": commit_date_for_git,
+            "GIT_COMMITTER_NAME": args.committer_name,
+            "GIT_COMMITTER_EMAIL": args.committer_email,
+            "GIT_COMMITTER_DATE": commit_date_for_git
+        }
 
-            status_output, _ = run_git_command(["git", "status", "--porcelain", snippet_folder_name], cwd=local_repo_path)
-            if status_output and status_output.strip():
-                _, commit_stderr = run_git_command(["git", "commit", "--allow-empty", "-m", final_commit_message],
-                                                   cwd=local_repo_path, env_vars=commit_env)
-                if commit_stderr and (
-                        "nothing to commit" in commit_stderr.lower() or "no changes added to commit" in commit_stderr.lower()):
-                    pass  # It's fine, sometimes git says this even if something was staged with allow-empty
-            else:
-                print(f"      No file changes to commit for revision {commit_sha[:7]}.")
+        final_commit_message = f"Snippet: {snippet_title} (ID: {snippet_id})\nRev: {commit_display_sha_for_log[:7]}\n\n{commit_message_summary}"
 
-        generate_snippet_readme(snippet_files_base_dir, snippet_title, snippet_id, bitbucket_html_link,
-                                current_files_in_snippet_dir_for_readme)
-        run_git_command(["git", "add", os.path.join(snippet_folder_name, "README.md")], cwd=local_repo_path)
-        status_output_readme, _ = run_git_command(["git", "status", "--porcelain", os.path.join(snippet_folder_name, "README.md")],
-                                                  cwd=local_repo_path)
+        status_output, _ = run_git_command(["git", "status", "--porcelain", snippet_folder_name], cwd=local_repo_path)
+        if status_output and status_output.strip():
+            print(f"      Committing revision {commit_display_sha_for_log[:7]} with date {commit_date_for_git}...")
+            run_git_command(["git", "commit", "--allow-empty", "-m", final_commit_message],
+                            cwd=local_repo_path, env_vars=commit_env)
+        elif args.historical:
+            print(f"    No file changes for historical revision {commit_display_sha_for_log[:7]}, making empty marker commit.")
+            run_git_command(["git", "commit", "--allow-empty", "--allow-empty-message", "-m", final_commit_message],
+                            cwd=local_repo_path, env_vars=commit_env)
+        elif not args.historical and not (status_output and status_output.strip()):
+            print(f"      No file changes to commit for revision {commit_display_sha_for_log[:7]}.")
 
-        # Only commit if the README has changed or is new
-        if status_output_readme and status_output_readme.strip():
+    print("\n--- Phase 4: Generating and Committing README files ---")
+    for snippet_readme_info in all_snippets_info_for_readme:
+        s_id = snippet_readme_info['id']
+        s_title = snippet_readme_info['title']
+        s_folder_name = snippet_readme_info['dir_name']
+        s_html_link = snippet_readme_info['html_link']
+        s_files = snippet_latest_file_lists.get(s_id, set())
+
+        s_base_dir = os.path.join(local_repo_path, s_folder_name)
+        generate_snippet_readme(s_base_dir, s_title, s_id, s_html_link, s_files)
+
+        readme_git_path = os.path.join(s_folder_name, "README.md")
+        run_git_command(["git", "add", readme_git_path], cwd=local_repo_path)
+
+        status_readme, _ = run_git_command(["git", "status", "--porcelain", readme_git_path], cwd=local_repo_path)
+        if status_readme and status_readme.strip():
             readme_commit_env = {
                 "GIT_AUTHOR_NAME": args.committer_name,
                 "GIT_AUTHOR_EMAIL": args.committer_email,
-                "GIT_AUTHOR_DATE": datetime.now(timezone.utc).isoformat(),  # MODIFIED
+                "GIT_AUTHOR_DATE": datetime.now(timezone.utc).isoformat(),
                 "GIT_COMMITTER_NAME": args.committer_name,
                 "GIT_COMMITTER_EMAIL": args.committer_email,
-                "GIT_COMMITTER_DATE": datetime.now(timezone.utc).isoformat()  # MODIFIED
+                "GIT_COMMITTER_DATE": datetime.now(timezone.utc).isoformat()
             }
-            run_git_command(["git", "commit", "-m", f"Update README for snippet: {snippet_title} (ID: {snippet_id})"],
+            run_git_command(["git", "commit", "-m", f"Update README for snippet: {s_title} (ID: {s_id})"],
                             cwd=local_repo_path, env_vars=readme_commit_env)
 
-        all_backed_up_snippets_info.append({'id': snippet_id, 'title': snippet_title, 'dir_name': snippet_folder_name})
-
-    generate_root_readme(local_repo_path, all_backed_up_snippets_info)
+    generate_root_readme(local_repo_path, all_snippets_info_for_readme)
     run_git_command(["git", "add", "README.md"], cwd=local_repo_path)
-    status_output_root_readme, _ = run_git_command(["git", "status", "--porcelain", "README.md"], cwd=local_repo_path)
-    if status_output_root_readme and status_output_root_readme.strip():
-        root_readme_commit_env = {
+    status_root_readme, _ = run_git_command(["git", "status", "--porcelain", "README.md"], cwd=local_repo_path)
+    if status_root_readme and status_root_readme.strip():
+        root_readme_env = {
             "GIT_AUTHOR_NAME": args.committer_name,
             "GIT_AUTHOR_EMAIL": args.committer_email,
             "GIT_AUTHOR_DATE": datetime.now(timezone.utc).isoformat(),
@@ -484,11 +531,11 @@ def main():
             "GIT_COMMITTER_DATE": datetime.now(timezone.utc).isoformat()
         }
         run_git_command(["git", "commit", "-m", "Update root README with snippet index"],
-                        cwd=local_repo_path, env_vars=root_readme_commit_env)
+                        cwd=local_repo_path, env_vars=root_readme_env)
 
     print("\nSnippet backup process complete.")
     print(f"All snippets and their revisions should be in: {os.path.abspath(local_repo_path)}")
-    print("You can now inspect the git log in that directory.")
+    print("You can now inspect the git log in that directory. It should be globally chronological.")
 
 
 if __name__ == "__main__":
